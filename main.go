@@ -25,6 +25,7 @@ import (
     "math/rand"
     "net/http"
     _ "net/http/pprof"
+    "runtime"
     "slices"
     "sort"
     "strconv"
@@ -79,6 +80,8 @@ func main() {
     // NEW FLAG CONFIGURATION
     var testDownload = flag.Bool("test-download", false, "measure download throughput instead of upload")
     var downloadObjectName = flag.String("download-object", "", "if set with -test-download, skips upload setup and loops downloading this existing object instead")
+    var printMemStats = flag.Bool("mem-stats", false, "print Go runtime memory stats (heap/alloc/GC) before and after each transport's run")
+    var memMonitorInterval = flag.Duration("mem-monitor-interval", 0, "if > 0, periodically print Go runtime memory stats at this interval for the life of the run (e.g. 10s)")
 
     flag.Parse()
 
@@ -179,6 +182,12 @@ func main() {
         warmupIterations: *warmupIterations,
         testDownload:     *testDownload,
         downloadObject:   *downloadObjectName,
+        printMemStats:    *printMemStats,
+    }
+
+    var stopMemMonitor func()
+    if *memMonitorInterval > 0 {
+        stopMemMonitor = startMemoryMonitor(*memMonitorInterval)
     }
 
     var wg sync.WaitGroup
@@ -192,6 +201,10 @@ func main() {
         go runWorkload()
     }
     wg.Wait()
+
+    if stopMemMonitor != nil {
+        stopMemMonitor()
+    }
     log.Println("Benchmark finished.")
 }
 
@@ -207,6 +220,7 @@ type BenchmarkConfig struct {
     warmupIterations int
     testDownload     bool
     downloadObject   string
+    printMemStats    bool
 }
 
 type Transport struct {
@@ -290,6 +304,11 @@ func w1r3Worker(ctx context.Context, config *BenchmarkConfig) {
             }
             sharedDownloadHandle = handle
             log.Printf("Download-test setup: uploaded %s (%d bytes) via %s", sharedDownloadName, objectSize, client.transport)
+        }
+
+        var memStatsBefore memSnapshot
+        if config.printMemStats {
+            memStatsBefore = captureMemSnapshot()
         }
 
         totalIterations := config.warmupIterations + config.iterations
@@ -382,6 +401,72 @@ func w1r3Worker(ctx context.Context, config *BenchmarkConfig) {
             fmt.Printf("P90 Latency:     %v\n", p90Latency.Round(time.Microsecond))
             fmt.Printf("P99 Latency:     %v\n", p99Latency.Round(time.Microsecond))
         }
+
+        if config.printMemStats {
+            printMemSnapshotDelta(client.transport, memStatsBefore, captureMemSnapshot())
+        }
+    }
+}
+
+// memSnapshot holds a point-in-time subset of runtime.MemStats relevant to
+// comparing heap/allocation behavior across transports and grpc-go branches.
+type memSnapshot struct {
+    heapAlloc  uint64
+    heapSys    uint64
+    sys        uint64
+    totalAlloc uint64
+    numGC      uint32
+}
+
+func captureMemSnapshot() memSnapshot {
+    var m runtime.MemStats
+    runtime.ReadMemStats(&m)
+    return memSnapshot{
+        heapAlloc:  m.HeapAlloc,
+        heapSys:    m.HeapSys,
+        sys:        m.Sys,
+        totalAlloc: m.TotalAlloc,
+        numGC:      m.NumGC,
+    }
+}
+
+func printMemSnapshotDelta(transport string, before, after memSnapshot) {
+    toMiB := func(b uint64) float64 { return float64(b) / MiB }
+    fmt.Printf("\n--- Memory Stats for --- %s\n", transport)
+    fmt.Printf("HeapAlloc:       %.2f MiB -> %.2f MiB\n", toMiB(before.heapAlloc), toMiB(after.heapAlloc))
+    fmt.Printf("HeapSys:         %.2f MiB\n", toMiB(after.heapSys))
+    fmt.Printf("Sys:             %.2f MiB\n", toMiB(after.sys))
+    fmt.Printf("TotalAlloc (Δ):  %.2f MiB\n", toMiB(after.totalAlloc-before.totalAlloc))
+    fmt.Printf("NumGC (Δ):       %d\n", after.numGC-before.numGC)
+}
+
+// startMemoryMonitor prints a memory-usage timeline at a fixed interval until
+// the returned stop function is called. Complements printMemSnapshotDelta
+// (one before/after delta per transport) with a view of how memory moves
+// across the whole run -- useful during a fixed-duration profiling window
+// (see capture_pprof.sh) to spot steady growth vs. GC sawtooth vs. a single
+// spike.
+func startMemoryMonitor(interval time.Duration) func() {
+    ticker := time.NewTicker(interval)
+    done := make(chan struct{})
+
+    go func() {
+        var m runtime.MemStats
+        for {
+            select {
+            case <-ticker.C:
+                runtime.ReadMemStats(&m)
+                fmt.Printf("[%s] In-Use (Alloc): %.2f MiB | OS Heap (HeapInuse): %.2f MiB | NumGC: %d\n",
+                    time.Now().Format("15:04:05"), float64(m.Alloc)/MiB, float64(m.HeapInuse)/MiB, m.NumGC)
+            case <-done:
+                ticker.Stop()
+                return
+            }
+        }
+    }()
+
+    return func() {
+        close(done)
     }
 }
 
