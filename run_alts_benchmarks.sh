@@ -45,6 +45,8 @@ parse_config() {
     CONFIG_TRANSPORTS=()
     CONFIG_PPROF_ADDR=""
     CONFIG_DOWNLOAD_OBJECT=""
+    CONFIG_MEM_STATS=""
+    CONFIG_MEM_MONITOR_INTERVAL=""
 
     while IFS='=' read -r key value || [ -n "$key" ]; do
         # Strip whitespace
@@ -75,6 +77,8 @@ parse_config() {
                 ;;
             pprof-addr|pprofAddr) CONFIG_PPROF_ADDR="$value" ;;
             download-object|downloadObject) CONFIG_DOWNLOAD_OBJECT="$value" ;;
+            mem-stats|memStats) CONFIG_MEM_STATS="$value" ;;
+            mem-monitor-interval|memMonitorInterval) CONFIG_MEM_MONITOR_INTERVAL="$value" ;;
             *) echo "Warning: Unknown config key: $key" ;;
         esac
     done < "$config_file"
@@ -106,6 +110,8 @@ CMD_ARGS=("-project-id" "$PROJECT_ID" "-bucket" "$BUCKET")
 [ "$CONFIG_TEST_DOWNLOAD" = "true" ] && CMD_ARGS+=("-test-download")
 [ -n "$CONFIG_PPROF_ADDR" ] && CMD_ARGS+=("-pprof-addr" "$CONFIG_PPROF_ADDR")
 [ -n "$CONFIG_DOWNLOAD_OBJECT" ] && CMD_ARGS+=("-download-object" "$CONFIG_DOWNLOAD_OBJECT")
+[ "$CONFIG_MEM_STATS" = "true" ] && CMD_ARGS+=("-mem-stats")
+[ -n "$CONFIG_MEM_MONITOR_INTERVAL" ] && CMD_ARGS+=("-mem-monitor-interval" "$CONFIG_MEM_MONITOR_INTERVAL")
 
 for size in "${CONFIG_OBJECT_SIZES[@]}"; do
     CMD_ARGS+=("-object-size" "$size")
