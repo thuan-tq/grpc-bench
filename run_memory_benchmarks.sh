@@ -2,14 +2,18 @@
 # run_memory_benchmarks.sh
 #
 # Companion to run_alts_benchmarks.sh: runs the same binary/config matrix but
-# wraps each invocation with `time` to capture peak resident set size (RSS)
-# instead of relying on the benchmark's own latency output. Kept as a separate
-# script so the latency pipeline (run_alts_benchmarks.sh -> analyze.py) is
-# untouched; results land in their own mem_test_*.txt files.
+# samples peak resident set size (RSS) of each binary via `ps` while it runs,
+# instead of relying on the benchmark's own latency output. Uses `ps` rather
+# than `/usr/bin/time -v/-l` because many minimal Linux images (this includes
+# some GCE VM images) don't ship the `time` binary at all, whereas `ps` is
+# always available on both Linux and macOS. Kept as a separate script so the
+# latency pipeline (run_alts_benchmarks.sh -> analyze.py) is untouched;
+# results land in their own mem_test_*.txt files.
 
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="$HOME/alts_benchmark/results"
 SLEEP_TIME=1                  # Cooldown seconds between runs
+SAMPLE_INTERVAL=0.5            # RSS polling interval in seconds
 
 CONFIG_FILE="${1:-"$BENCH_DIR/default.conf"}"
 OUT_DIR="$2"
@@ -118,39 +122,26 @@ for t in "${CONFIG_TRANSPORTS[@]}"; do
     CMD_ARGS+=("-transport" "$t")
 done
 
-# Pick a `time` invocation that reports peak RSS, and how to read its output.
-# GNU time (Linux, "time -v"):  "Maximum resident set size (kbytes): N"
-# BSD time  (macOS, "time -l"): "N  maximum resident set size"          (bytes)
-TIME_BIN="/usr/bin/time"
-probe_out="$(mktemp)"
-if "$TIME_BIN" -v true >/dev/null 2>"$probe_out"; then
-    TIME_FLAG="-v"
-elif "$TIME_BIN" -l true >/dev/null 2>"$probe_out"; then
-    TIME_FLAG="-l"
-else
-    echo "❌ Error: '$TIME_BIN' supports neither -v (GNU) nor -l (BSD) on this system."
-    rm -f "$probe_out"
-    exit 1
-fi
-rm -f "$probe_out"
-
-# Extracts peak RSS in KB from a captured `time` report, regardless of flavor.
-extract_peak_rss_kb() {
-    local time_output_file="$1"
-    if [ "$TIME_FLAG" = "-v" ]; then
-        grep "Maximum resident set size" "$time_output_file" | grep -oE '[0-9]+'
-    else
-        local bytes
-        bytes=$(grep "maximum resident set size" "$time_output_file" | grep -oE '[0-9]+')
-        [ -n "$bytes" ] && echo $(( bytes / 1024 ))
-    fi
+# Polls a running PID's RSS (KB, consistent across Linux/macOS `ps`) until it
+# exits, printing the maximum value seen.
+sample_peak_rss_kb() {
+    local pid="$1"
+    local peak=0
+    local sample
+    while kill -0 "$pid" 2>/dev/null; do
+        sample="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+        if [ -n "$sample" ] && [ "$sample" -gt "$peak" ] 2>/dev/null; then
+            peak="$sample"
+        fi
+        sleep "$SAMPLE_INTERVAL"
+    done
+    echo "$peak"
 }
 
 mkdir -p "$RESULTS_DIR/$OUT_DIR"
 echo "Starting memory benchmarks with $LOOPS loops."
 echo "Results directory: $RESULTS_DIR/$OUT_DIR/"
 echo "Command args for binaries: ${CMD_ARGS[@]}"
-echo "Using: $TIME_BIN $TIME_FLAG"
 
 for i in $(seq 1 $LOOPS); do
     echo -e "\n=========================================="
@@ -169,7 +160,6 @@ for i in $(seq 1 $LOOPS); do
         fi
 
         outfile="$RESULTS_DIR/$OUT_DIR/mem_test_${branch_label}_default.txt"
-        time_report="$(mktemp)"
 
         echo -e "\n==========================================" >> "$outfile"
         echo "   Running Memory Run #$i of $LOOPS" >> "$outfile"
@@ -177,20 +167,14 @@ for i in $(seq 1 $LOOPS); do
 
         echo "  ▶️  Running Test [Binary: $bin (Label: $branch_label)] -> $(basename "$outfile")"
 
-        # stdout (benchmark's own log/latency output) goes straight to outfile;
-        # stderr is `time`'s report, captured separately so it can be parsed.
-        "$TIME_BIN" "$TIME_FLAG" "$BENCH_DIR/bin/$bin" "${CMD_ARGS[@]}" >> "$outfile" 2>"$time_report"
-        cat "$time_report" >> "$outfile"
+        "$BENCH_DIR/bin/$bin" "${CMD_ARGS[@]}" >> "$outfile" 2>&1 &
+        bin_pid=$!
 
-        peak_kb="$(extract_peak_rss_kb "$time_report")"
-        if [ -n "$peak_kb" ]; then
-            echo "Peak RSS (KB): $peak_kb" >> "$outfile"
-            echo "     Peak RSS: ${peak_kb} KB"
-        else
-            echo "     ⚠️  Could not parse peak RSS from $TIME_BIN output"
-        fi
+        peak_kb="$(sample_peak_rss_kb "$bin_pid")"
+        wait "$bin_pid"
 
-        rm -f "$time_report"
+        echo "Peak RSS (KB): $peak_kb" >> "$outfile"
+        echo "     Peak RSS: ${peak_kb} KB"
 
         echo "     [Cooling down sockets & GC for $SLEEP_TIME seconds...]"
         sleep "$SLEEP_TIME"
